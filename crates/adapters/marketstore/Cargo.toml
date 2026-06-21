@@ -1,0 +1,72 @@
+[package]
+name = "nautilus-marketstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MarketStore integration adapter for the Nautilus trading engine"
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "nautilus_marketstore"
+crate-type = ["rlib"]
+
+# The engine-agnostic source (decode/grpc/symbology/loader/common + proto build) is the
+# SINGLE SOURCE OF TRUTH in the trading repo at ../trading/crates/marketstore and is brought
+# in here via `#[path]` includes (see src/lib.rs) so it compiles against THIS crate's
+# nautilus deps (fork HEAD, high-precision ON) — not the standalone workspace's crates.io 0.58.
+# Only the in-wheel-only modules (config/instruments/factories/data + pyo3) live here.
+
+[features]
+default = ["live"]
+extension-module = [
+  "nautilus-core/extension-module",
+  "nautilus-live?/extension-module",
+  "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+live = ["nautilus-live", "nautilus-live/node", "nautilus-system"]
+python = [
+  "live",
+  "nautilus-core/python",
+  "nautilus-live/python",
+  "nautilus-model/python",
+  "nautilus-system/python",
+  "pyo3",
+]
+high-precision = ["nautilus-model/high-precision"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true, optional = true }
+nautilus-model = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+
+# gRPC: the fork pins tonic 0.13 (runtime-only, no codegen in the workspace), so this
+# adapter carries its OWN codegen at the matching 0.13 line and turns ON the codegen/prost/
+# transport features (the workspace dep is default-features=false). The shared grpc.rs source
+# uses only stable client APIs identical across 0.13/0.14.
+tonic = { workspace = true, features = ["codegen", "prost", "transport", "channel"] }
+prost = "0.13"
+
+pyo3 = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
