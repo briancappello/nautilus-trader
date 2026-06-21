@@ -7,7 +7,10 @@
 //! This first cut implements the request/response (historical) path + instrument provision;
 //! WebSocket live streaming (`subscribe_bars`) lands in Phase 3.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use nautilus_common::{
@@ -17,6 +20,7 @@ use nautilus_common::{
         DataEvent,
         data::{
             BarsResponse, DataResponse, InstrumentsResponse, RequestBars, RequestInstruments,
+            SubscribeBars, UnsubscribeBars,
         },
     },
 };
@@ -25,15 +29,36 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
+    data::bar::{BarType, get_bar_interval_ns},
     identifiers::{ClientId, Venue},
     instruments::InstrumentAny,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::MarketStoreDataClientConfig, grpc::MarketStoreGrpcClient,
-    instruments::instruments_from_config, loader::load_bars,
+    config::MarketStoreDataClientConfig,
+    grpc::MarketStoreGrpcClient,
+    instruments::instruments_from_config,
+    loader::load_bars,
+    symbology::bar_type_to_tbk,
+    ws::{ReplayWindow, TbkSubscription, spawn_ws_session},
 };
+
+/// Derives the `/ws/replay` endpoint from the configured live `/ws` endpoint.
+///
+/// `ws://host:5993/ws` -> `ws://host:5993/ws/replay`. If the endpoint already targets
+/// `/ws/replay` it is returned unchanged.
+fn replay_endpoint(ws_endpoint: &str) -> String {
+    if ws_endpoint.ends_with("/ws/replay") {
+        ws_endpoint.to_string()
+    } else if let Some(base) = ws_endpoint.strip_suffix("/ws") {
+        format!("{base}/ws/replay")
+    } else {
+        // Fall back to appending; covers custom endpoints.
+        format!("{}/replay", ws_endpoint.trim_end_matches('/'))
+    }
+}
 
 /// The live MarketStore data client.
 #[derive(Debug)]
@@ -45,6 +70,13 @@ pub struct MarketStoreDataClient {
     is_connected: AtomicBool,
     data_sender: UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
+    /// Active bar subscriptions keyed by TBK (the WS `key`); rebuilt into a WS session
+    /// whenever the set changes (MarketStore has no per-TBK unsubscribe).
+    subscriptions: HashMap<String, TbkSubscription>,
+    /// Cancels the running WS session task (if any).
+    ws_cancel: Option<CancellationToken>,
+    /// Handle to the running WS session task.
+    ws_task: Option<JoinHandle<()>>,
 }
 
 impl MarketStoreDataClient {
@@ -66,7 +98,55 @@ impl MarketStoreDataClient {
             is_connected: AtomicBool::new(false),
             data_sender,
             clock,
+            subscriptions: HashMap::new(),
+            ws_cancel: None,
+            ws_task: None,
         })
+    }
+
+    /// (Re)starts the WS streaming session covering the current subscription set.
+    ///
+    /// MarketStore takes the full TBK list at subscribe time and has no granular
+    /// unsubscribe, so any change tears down and reopens the session with the new set.
+    fn restart_ws_session(&mut self) {
+        // Cancel any existing session.
+        if let Some(token) = self.ws_cancel.take() {
+            token.cancel();
+        }
+        self.ws_task = None;
+
+        if self.subscriptions.is_empty() {
+            return;
+        }
+
+        // Replay mode connects to /ws/replay with a window; live uses the configured /ws.
+        let (ws_url, replay) = match &self.config.replay {
+            Some(r) => (
+                replay_endpoint(&self.config.ws_endpoint),
+                Some(ReplayWindow {
+                    start: r.start.clone(),
+                    end: r.end.clone(),
+                    step: r.step,
+                }),
+            ),
+            None => (self.config.ws_endpoint.clone(), None),
+        };
+
+        let cancel = CancellationToken::new();
+        let handle = spawn_ws_session(
+            ws_url,
+            self.subscriptions.clone(),
+            replay,
+            self.data_sender.clone(),
+            cancel.clone(),
+        );
+        self.ws_cancel = Some(cancel);
+        self.ws_task = Some(handle);
+    }
+
+    /// Resolves `(price_precision, size_precision)` for a `BarType`'s symbol.
+    fn precision_for_bar_type(&self, bar_type: &BarType) -> (u8, u8) {
+        self.precision_for(bar_type.instrument_id().symbol.as_str())
     }
 
     /// Resolves the display precision `(price, size)` for `symbol`, falling back to the
@@ -100,6 +180,10 @@ impl DataClient for MarketStoreDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(token) = self.ws_cancel.take() {
+            token.cancel();
+        }
+        self.ws_task = None;
         self.is_connected.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -122,7 +206,8 @@ impl DataClient for MarketStoreDataClient {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         // Bootstrap: push the synthesized instruments onto the bus so strategies/scanners
-        // can look them up. (Live bar streaming is wired in Phase 3.)
+        // can look them up. Live bar streaming starts on the first `subscribe_bars`
+        // (MarketStore takes the TBK set at subscribe time).
         for instrument in &self.instruments {
             if let Err(e) = self
                 .data_sender
@@ -132,11 +217,48 @@ impl DataClient for MarketStoreDataClient {
             }
         }
         self.is_connected.store(true, Ordering::SeqCst);
+        // If subscriptions were registered before connect, (re)start the session now.
+        if !self.subscriptions.is_empty() {
+            self.restart_ws_session();
+        }
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        if let Some(token) = self.ws_cancel.take() {
+            token.cancel();
+        }
+        self.ws_task = None;
         self.is_connected.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        let bar_type = cmd.bar_type;
+        let tbk = bar_type_to_tbk(&bar_type)?;
+        let (price_precision, size_precision) = self.precision_for_bar_type(&bar_type);
+        self.subscriptions.insert(
+            tbk,
+            TbkSubscription {
+                bar_type,
+                price_precision,
+                size_precision,
+                ts_init_delta_ns: get_bar_interval_ns(&bar_type).as_u64(),
+            },
+        );
+        // (Re)start the session with the new superset (no granular subscribe over WS).
+        if self.is_connected() {
+            self.restart_ws_session();
+        }
+        Ok(())
+    }
+
+    fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
+        let tbk = bar_type_to_tbk(&cmd.bar_type)?;
+        self.subscriptions.remove(&tbk);
+        if self.is_connected() {
+            self.restart_ws_session();
+        }
         Ok(())
     }
 
