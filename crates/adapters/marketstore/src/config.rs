@@ -47,6 +47,8 @@ impl InstrumentSpec {
 pub struct MarketStoreDataClientConfig {
     /// The gRPC endpoint for historical `Query` (e.g. `"http://127.0.0.1:5995"`).
     pub grpc_endpoint: String,
+    /// The WebSocket endpoint for live streaming (e.g. `"ws://127.0.0.1:5993/ws"`).
+    pub ws_endpoint: String,
     /// The synthetic venue baked into every `InstrumentId` (default `NASDAQ`).
     pub venue: String,
     /// The universe of equities to serve (instruments + subscribable symbols).
@@ -55,6 +57,22 @@ pub struct MarketStoreDataClientConfig {
     pub price_precision: u8,
     /// Fallback size precision for symbols not in `instruments`.
     pub size_precision: u8,
+    /// Optional replay window. When set, the streaming session connects to `/ws/replay`
+    /// (instead of `/ws`) and replays historical bars over the window as if live — the
+    /// off-hours way to exercise the live `DataClient` (same decode/bus path). `None` =
+    /// real live streaming.
+    pub replay: Option<ReplayConfig>,
+}
+
+/// Historical replay window for the `/ws/replay` endpoint (off-hours live simulation).
+#[derive(Clone, Debug)]
+pub struct ReplayConfig {
+    /// Inclusive start (server-accepted format, e.g. `"2026-06-18 23:49:00"`).
+    pub start: String,
+    /// Inclusive end (must be after `start`).
+    pub end: String,
+    /// Milliseconds between epoch batches. `0` = send all immediately; <10ms clamped to 10ms.
+    pub step: i64,
 }
 
 impl MarketStoreDataClientConfig {
@@ -62,17 +80,21 @@ impl MarketStoreDataClientConfig {
     #[must_use]
     pub fn new(
         grpc_endpoint: String,
+        ws_endpoint: String,
         venue: String,
         instruments: Vec<InstrumentSpec>,
         price_precision: u8,
         size_precision: u8,
+        replay: Option<ReplayConfig>,
     ) -> Self {
         Self {
             grpc_endpoint,
+            ws_endpoint,
             venue,
             instruments,
             price_precision,
             size_precision,
+            replay,
         }
     }
 }
