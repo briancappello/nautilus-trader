@@ -41,7 +41,19 @@ pub use grpc::MarketStoreGrpcClient;
 pub use loader::{load_bars, load_raw_bars};
 
 // --- In-wheel-only modules (live DataClient glue) ---------------------------
-// Added incrementally in Phase 2+: config, instruments, factories, data.
+pub mod config;
+pub mod instruments;
+
+#[cfg(feature = "live")]
+pub mod data;
+#[cfg(feature = "live")]
+pub mod factories;
+
+pub use config::{InstrumentSpec, MarketStoreDataClientConfig};
+#[cfg(feature = "live")]
+pub use data::MarketStoreDataClient;
+#[cfg(feature = "live")]
+pub use factories::MarketStoreDataClientFactory;
 
 #[cfg(feature = "python")]
 pub mod python;
