@@ -316,6 +316,13 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cython-compat")]
     re_export_module_attributes(m, n)?;
 
+    let n = "marketstore";
+    let submodule = pyo3::wrap_pymodule!(nautilus_marketstore::python::marketstore);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
     let n = "okx";
     let submodule = pyo3::wrap_pymodule!(nautilus_okx::python::okx);
     m.add_wrapped(submodule)?;
