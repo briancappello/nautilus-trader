@@ -19,8 +19,10 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, DataResponse, InstrumentsResponse, RequestBars, RequestInstruments,
-            SubscribeBars, UnsubscribeBars,
+            BarsResponse, DataResponse, InstrumentsResponse, QuotesResponse, RequestBars,
+            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeQuotes,
+            UnsubscribeTrades,
         },
     },
 };
@@ -40,9 +42,9 @@ use crate::{
     config::MarketStoreDataClientConfig,
     grpc::MarketStoreGrpcClient,
     instruments::instruments_from_config,
-    loader::load_bars,
-    symbology::bar_type_to_tbk,
-    ws::{ReplayWindow, TbkSubscription, spawn_ws_session},
+    loader::{load_bars, load_quote_ticks, load_trade_ticks},
+    symbology::{bar_type_to_tbk, quote_tbk, trade_tbk},
+    ws::{ReplayWindow, SubKind, TbkSubscription, spawn_ws_session},
 };
 
 /// Derives the `/ws/replay` endpoint from the configured live `/ws` endpoint.
@@ -149,6 +151,14 @@ impl MarketStoreDataClient {
         self.precision_for(bar_type.instrument_id().symbol.as_str())
     }
 
+    /// (Re)starts the WS session if connected (MarketStore has no granular un/subscribe;
+    /// any change reopens with the current TBK superset).
+    fn restart_if_connected(&mut self) {
+        if self.is_connected() {
+            self.restart_ws_session();
+        }
+    }
+
     /// Resolves the display precision `(price, size)` for `symbol`, falling back to the
     /// config defaults for symbols not explicitly specified.
     fn precision_for(&self, symbol: &str) -> (u8, u8) {
@@ -240,25 +250,68 @@ impl DataClient for MarketStoreDataClient {
         self.subscriptions.insert(
             tbk,
             TbkSubscription {
-                bar_type,
+                kind: SubKind::Bar {
+                    bar_type,
+                    ts_init_delta_ns: get_bar_interval_ns(&bar_type).as_u64(),
+                },
                 price_precision,
                 size_precision,
-                ts_init_delta_ns: get_bar_interval_ns(&bar_type).as_u64(),
             },
         );
-        // (Re)start the session with the new superset (no granular subscribe over WS).
-        if self.is_connected() {
-            self.restart_ws_session();
-        }
+        self.restart_if_connected();
         Ok(())
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         let tbk = bar_type_to_tbk(&cmd.bar_type)?;
         self.subscriptions.remove(&tbk);
-        if self.is_connected() {
-            self.restart_ws_session();
-        }
+        self.restart_if_connected();
+        Ok(())
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let tbk = trade_tbk(&instrument_id);
+        let (price_precision, size_precision) =
+            self.precision_for(instrument_id.symbol.as_str());
+        self.subscriptions.insert(
+            tbk,
+            TbkSubscription {
+                kind: SubKind::Trade { instrument_id },
+                price_precision,
+                size_precision,
+            },
+        );
+        self.restart_if_connected();
+        Ok(())
+    }
+
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        self.subscriptions.remove(&trade_tbk(&cmd.instrument_id));
+        self.restart_if_connected();
+        Ok(())
+    }
+
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let tbk = quote_tbk(&instrument_id);
+        let (price_precision, size_precision) =
+            self.precision_for(instrument_id.symbol.as_str());
+        self.subscriptions.insert(
+            tbk,
+            TbkSubscription {
+                kind: SubKind::Quote { instrument_id },
+                price_precision,
+                size_precision,
+            },
+        );
+        self.restart_if_connected();
+        Ok(())
+    }
+
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        self.subscriptions.remove(&quote_tbk(&cmd.instrument_id));
+        self.restart_if_connected();
         Ok(())
     }
 
@@ -333,6 +386,114 @@ impl DataClient for MarketStoreDataClient {
         if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
             log::error!("Failed to send instruments response: {e}");
         }
+        Ok(())
+    }
+
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let sender = self.data_sender.clone();
+        let endpoint = self.config.grpc_endpoint.clone();
+        let instrument_id = request.instrument_id;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let limit = request.limit.map_or(0, |n| n.get() as i32);
+        let (price_precision, size_precision) =
+            self.precision_for(instrument_id.symbol.as_str());
+
+        get_runtime().spawn(async move {
+            let client = match MarketStoreGrpcClient::connect(endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("MarketStore connect failed for trades request: {e:?}");
+                    return;
+                }
+            };
+            match load_trade_ticks(
+                &client,
+                instrument_id,
+                start_nanos,
+                end_nanos,
+                limit,
+                price_precision,
+                size_precision,
+            )
+            .await
+            {
+                Ok(trades) => {
+                    let response = DataResponse::Trades(TradesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        trades,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send trades response: {e}");
+                    }
+                }
+                Err(e) => log::error!("MarketStore trades request failed: {e:?}"),
+            }
+        });
+        Ok(())
+    }
+
+    fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
+        let sender = self.data_sender.clone();
+        let endpoint = self.config.grpc_endpoint.clone();
+        let instrument_id = request.instrument_id;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let limit = request.limit.map_or(0, |n| n.get() as i32);
+        let (price_precision, size_precision) =
+            self.precision_for(instrument_id.symbol.as_str());
+
+        get_runtime().spawn(async move {
+            let client = match MarketStoreGrpcClient::connect(endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("MarketStore connect failed for quotes request: {e:?}");
+                    return;
+                }
+            };
+            match load_quote_ticks(
+                &client,
+                instrument_id,
+                start_nanos,
+                end_nanos,
+                limit,
+                price_precision,
+                size_precision,
+            )
+            .await
+            {
+                Ok(quotes) => {
+                    let response = DataResponse::Quotes(QuotesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        quotes,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send quotes response: {e}");
+                    }
+                }
+                Err(e) => log::error!("MarketStore quotes request failed: {e:?}"),
+            }
+        });
         Ok(())
     }
 }

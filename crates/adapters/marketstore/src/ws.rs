@@ -22,20 +22,38 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::{connect_async, tungstenite};
 use tokio_util::sync::CancellationToken;
 
-use crate::decode::{StreamError, StreamPayload, bar_from_ws_row};
+use nautilus_model::identifiers::InstrumentId;
+
+use crate::decode::{
+    StreamError, StreamPayload, bar_from_ws_row, quote_from_ws_row, trade_from_ws_row,
+};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Per-TBK subscription metadata: the resolved `BarType` (the TBK carries no venue), the
-/// display precisions to apply when decoding rows, and the bar interval used to shift
-/// `ts_init` to the bar close.
+/// What kind of data a TBK subscription carries, with the per-kind decode context.
+///
+/// The TBK (the WS `key`) carries no venue, so the resolved `BarType`/`InstrumentId` is
+/// captured at subscribe time and used to build the wheel object on each incoming row.
+#[derive(Debug, Clone)]
+pub enum SubKind {
+    /// `OHLCV` → `Bar`. `ts_init_delta_ns` shifts `ts_init` to the bar close.
+    Bar {
+        bar_type: BarType,
+        ts_init_delta_ns: u64,
+    },
+    /// `TRADE` → `TradeTick` (point-in-time).
+    Trade { instrument_id: InstrumentId },
+    /// `QUOTE` → `QuoteTick` (point-in-time).
+    Quote { instrument_id: InstrumentId },
+}
+
+/// Per-TBK subscription metadata: the data kind + display precisions for decoding rows.
 #[derive(Debug, Clone)]
 pub struct TbkSubscription {
-    pub bar_type: BarType,
+    pub kind: SubKind,
     pub price_precision: u8,
     pub size_precision: u8,
-    pub ts_init_delta_ns: u64,
 }
 
 /// A replay window for the `/ws/replay` endpoint (off-hours live simulation).
@@ -236,19 +254,40 @@ fn handle_binary(
             log::debug!("WS row for unsubscribed key {}", payload.key);
             return FrameOutcome::Continue;
         };
-        match bar_from_ws_row(
-            &payload.data,
-            sub.bar_type,
-            sub.price_precision,
-            sub.size_precision,
-            sub.ts_init_delta_ns,
-        ) {
-            Ok(bar) => {
-                if let Err(e) = data_sender.send(DataEvent::Data(Data::Bar(bar))) {
-                    log::error!("Failed to send live bar: {e}");
+        let result: anyhow::Result<Data> = match &sub.kind {
+            SubKind::Bar {
+                bar_type,
+                ts_init_delta_ns,
+            } => bar_from_ws_row(
+                &payload.data,
+                *bar_type,
+                sub.price_precision,
+                sub.size_precision,
+                *ts_init_delta_ns,
+            )
+            .map(Data::Bar),
+            SubKind::Trade { instrument_id } => trade_from_ws_row(
+                &payload.data,
+                *instrument_id,
+                sub.price_precision,
+                sub.size_precision,
+            )
+            .map(Data::Trade),
+            SubKind::Quote { instrument_id } => quote_from_ws_row(
+                &payload.data,
+                *instrument_id,
+                sub.price_precision,
+                sub.size_precision,
+            )
+            .map(Data::Quote),
+        };
+        match result {
+            Ok(data) => {
+                if let Err(e) = data_sender.send(DataEvent::Data(data)) {
+                    log::error!("Failed to send live data: {e}");
                 }
             }
-            Err(e) => log::warn!("Failed to decode WS bar for {}: {e}", payload.key),
+            Err(e) => log::warn!("Failed to decode WS row for {}: {e}", payload.key),
         }
         return FrameOutcome::Continue;
     }
