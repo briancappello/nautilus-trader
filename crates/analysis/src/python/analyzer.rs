@@ -20,8 +20,10 @@ use std::{
 
 use nautilus_core::{UnixNanos, python::to_pyvalue_err};
 use nautilus_model::{
+    accounts::{Account, AccountAny},
     identifiers::PositionId,
     position::Position,
+    python::account::pyobject_to_account_any,
     types::{Currency, Money},
 };
 use pyo3::prelude::*;
@@ -30,9 +32,10 @@ use crate::{
     Returns,
     analyzer::{PortfolioAnalyzer, Statistic},
     statistics::{
-        alpha::Alpha, beta_ratio::BetaRatio, expectancy::Expectancy,
-        information_ratio::InformationRatio, long_ratio::LongRatio, loser_avg::AvgLoser,
-        loser_max::MaxLoser, loser_min::MinLoser, profit_factor::ProfitFactor,
+        alpha::Alpha, beta_ratio::BetaRatio, cagr::CAGR, calmar_ratio::CalmarRatio,
+        expectancy::Expectancy, information_ratio::InformationRatio, long_ratio::LongRatio,
+        loser_avg::AvgLoser, loser_max::MaxLoser, loser_min::MinLoser,
+        max_drawdown::MaxDrawdown, profit_factor::ProfitFactor,
         returns_avg::ReturnsAverage, returns_avg_loss::ReturnsAverageLoss,
         returns_avg_win::ReturnsAverageWin, returns_volatility::ReturnsVolatility,
         risk_return_ratio::RiskReturnRatio, sharpe_ratio::SharpeRatio, sortino_ratio::SortinoRatio,
@@ -242,6 +245,18 @@ impl PortfolioAnalyzer {
                 let stat = statistic.extract::<TreynorRatio>(py)?;
                 self.register_statistic(Arc::new(stat));
             }
+            "MaxDrawdown" => {
+                let stat = statistic.extract::<MaxDrawdown>(py)?;
+                self.register_statistic(Arc::new(stat));
+            }
+            "CAGR" => {
+                let stat = statistic.extract::<CAGR>(py)?;
+                self.register_statistic(Arc::new(stat));
+            }
+            "CalmarRatio" => {
+                let stat = statistic.extract::<CalmarRatio>(py)?;
+                self.register_statistic(Arc::new(stat));
+            }
             _ => {
                 return Err(to_pyvalue_err(format!(
                     "Unknown statistic type: {type_name}"
@@ -350,6 +365,18 @@ impl PortfolioAnalyzer {
                 let stat = statistic.extract::<TreynorRatio>(py)?;
                 self.deregister_statistic(&(Arc::new(stat) as Statistic));
             }
+            "MaxDrawdown" => {
+                let stat = statistic.extract::<MaxDrawdown>(py)?;
+                self.deregister_statistic(&(Arc::new(stat) as Statistic));
+            }
+            "CAGR" => {
+                let stat = statistic.extract::<CAGR>(py)?;
+                self.deregister_statistic(&(Arc::new(stat) as Statistic));
+            }
+            "CalmarRatio" => {
+                let stat = statistic.extract::<CalmarRatio>(py)?;
+                self.deregister_statistic(&(Arc::new(stat) as Statistic));
+            }
             _ => {
                 return Err(to_pyvalue_err(format!(
                     "Unknown statistic type: {type_name}"
@@ -406,8 +433,37 @@ impl PortfolioAnalyzer {
         self.record_trade(position_id, realized_pnl);
     }
 
-    // Note: calculate_statistics is not exposed to Python because it requires
-    // complex conversions of Account and dict types. Use the Python analyzer.py wrapper instead.
+    /// Calculates statistics from an account and its positions.
+    ///
+    /// Sets starting/current balances from the account, adds the positions, and
+    /// derives daily portfolio returns from the account's event history. This is
+    /// the same routine the backtest engine runs internally, exposed so the
+    /// live/paper path can compute identical returns-based statistics from the
+    /// cache (no `BacktestResult` required).
+    ///
+    /// `account` is any pyo3 account object (Cash/Margin/Betting); `positions`
+    /// is a list of pyo3 `Position` objects (typically `cache.positions()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PyErr` if the account or positions cannot be converted.
+    #[pyo3(name = "calculate_statistics")]
+    #[expect(clippy::needless_pass_by_value)]
+    fn py_calculate_statistics(
+        &mut self,
+        py: Python,
+        account: Py<PyAny>,
+        positions: Vec<Position>,
+    ) -> PyResult<()> {
+        let account_any = pyobject_to_account_any(py, account)?;
+        let account_ref: &dyn Account = match &account_any {
+            AccountAny::Margin(margin) => margin,
+            AccountAny::Cash(cash) => cash,
+            AccountAny::Betting(betting) => betting,
+        };
+        self.calculate_statistics(account_ref, &positions);
+        Ok(())
+    }
 
     /// Retrieves a specific statistic by name.
     #[pyo3(name = "statistic")]
