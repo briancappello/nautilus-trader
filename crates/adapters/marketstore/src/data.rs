@@ -9,7 +9,11 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -35,7 +39,7 @@ use nautilus_model::{
     identifiers::{ClientId, Venue},
     instruments::InstrumentAny,
 };
-use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -62,6 +66,43 @@ fn replay_endpoint(ws_endpoint: &str) -> String {
     }
 }
 
+/// Cancels any running WS session and, if there are subscriptions, spawns a fresh one
+/// covering the current TBK superset. Operates on the client's shared state so it can be
+/// driven from a debounced background task.
+fn restart_session(
+    config: &MarketStoreDataClientConfig,
+    subscriptions: &Arc<Mutex<HashMap<String, TbkSubscription>>>,
+    ws_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    data_sender: &UnboundedSender<DataEvent>,
+) {
+    // Cancel the existing session (if any).
+    if let Some(token) = ws_cancel.lock().unwrap().take() {
+        token.cancel();
+    }
+
+    let subs = subscriptions.lock().unwrap().clone();
+    if subs.is_empty() {
+        return;
+    }
+
+    // Replay mode connects to /ws/replay with a window; live uses the configured /ws.
+    let (ws_url, replay) = match &config.replay {
+        Some(r) => (
+            replay_endpoint(&config.ws_endpoint),
+            Some(ReplayWindow {
+                start: r.start.clone(),
+                end: r.end.clone(),
+                step: r.step,
+            }),
+        ),
+        None => (config.ws_endpoint.clone(), None),
+    };
+
+    let cancel = CancellationToken::new();
+    spawn_ws_session(ws_url, subs, replay, data_sender.clone(), cancel.clone());
+    *ws_cancel.lock().unwrap() = Some(cancel);
+}
+
 /// The live MarketStore data client.
 #[derive(Debug)]
 pub struct MarketStoreDataClient {
@@ -72,13 +113,15 @@ pub struct MarketStoreDataClient {
     is_connected: AtomicBool,
     data_sender: UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
-    /// Active bar subscriptions keyed by TBK (the WS `key`); rebuilt into a WS session
+    /// Active subscriptions keyed by TBK (the WS `key`); rebuilt into a WS session
     /// whenever the set changes (MarketStore has no per-TBK unsubscribe).
-    subscriptions: HashMap<String, TbkSubscription>,
+    subscriptions: Arc<Mutex<HashMap<String, TbkSubscription>>>,
     /// Cancels the running WS session task (if any).
-    ws_cancel: Option<CancellationToken>,
-    /// Handle to the running WS session task.
-    ws_task: Option<JoinHandle<()>>,
+    ws_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// Restart generation: bumped on every subscribe/unsubscribe so debounced restart
+    /// tasks can tell whether they are still the latest (coalesces back-to-back
+    /// subscribes into a single session with the full TBK superset).
+    restart_gen: Arc<AtomicU64>,
 }
 
 impl MarketStoreDataClient {
@@ -100,50 +143,25 @@ impl MarketStoreDataClient {
             is_connected: AtomicBool::new(false),
             data_sender,
             clock,
-            subscriptions: HashMap::new(),
-            ws_cancel: None,
-            ws_task: None,
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            ws_cancel: Arc::new(Mutex::new(None)),
+            restart_gen: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// (Re)starts the WS streaming session covering the current subscription set.
+    /// Immediately (re)starts the WS session covering the current subscription set.
     ///
     /// MarketStore takes the full TBK list at subscribe time and has no granular
     /// unsubscribe, so any change tears down and reopens the session with the new set.
-    fn restart_ws_session(&mut self) {
-        // Cancel any existing session.
-        if let Some(token) = self.ws_cancel.take() {
-            token.cancel();
-        }
-        self.ws_task = None;
-
-        if self.subscriptions.is_empty() {
-            return;
-        }
-
-        // Replay mode connects to /ws/replay with a window; live uses the configured /ws.
-        let (ws_url, replay) = match &self.config.replay {
-            Some(r) => (
-                replay_endpoint(&self.config.ws_endpoint),
-                Some(ReplayWindow {
-                    start: r.start.clone(),
-                    end: r.end.clone(),
-                    step: r.step,
-                }),
-            ),
-            None => (self.config.ws_endpoint.clone(), None),
-        };
-
-        let cancel = CancellationToken::new();
-        let handle = spawn_ws_session(
-            ws_url,
-            self.subscriptions.clone(),
-            replay,
-            self.data_sender.clone(),
-            cancel.clone(),
+    /// Prefer [`Self::restart_if_connected`] from the `subscribe_*`/`unsubscribe_*`
+    /// handlers — it debounces so back-to-back calls produce ONE session.
+    fn restart_now(&self) {
+        restart_session(
+            &self.config,
+            &self.subscriptions,
+            &self.ws_cancel,
+            &self.data_sender,
         );
-        self.ws_cancel = Some(cancel);
-        self.ws_task = Some(handle);
     }
 
     /// Resolves `(price_precision, size_precision)` for a `BarType`'s symbol.
@@ -151,12 +169,32 @@ impl MarketStoreDataClient {
         self.precision_for(bar_type.instrument_id().symbol.as_str())
     }
 
-    /// (Re)starts the WS session if connected (MarketStore has no granular un/subscribe;
-    /// any change reopens with the current TBK superset).
-    fn restart_if_connected(&mut self) {
-        if self.is_connected() {
-            self.restart_ws_session();
+    /// Debounced (re)start used by the `subscribe_*`/`unsubscribe_*` handlers.
+    ///
+    /// Actors typically issue several subscriptions back-to-back (e.g. trades + quotes in
+    /// `on_start`). Restarting the WS session synchronously on each would race —
+    /// replay is one-shot and each restart cancels the prior in-flight connect. Instead,
+    /// bump a generation counter and schedule the real restart after a short delay; only
+    /// the task whose generation is still current actually restarts, so the burst
+    /// coalesces into a single session covering the full TBK superset.
+    fn restart_if_connected(&self) {
+        if !self.is_connected() {
+            return;
         }
+        let my_gen = self.restart_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let restart_gen = self.restart_gen.clone();
+        let config = self.config.clone();
+        let subscriptions = self.subscriptions.clone();
+        let ws_cancel = self.ws_cancel.clone();
+        let data_sender = self.data_sender.clone();
+        get_runtime().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Superseded by a later subscribe in the same burst — let that one restart.
+            if restart_gen.load(Ordering::SeqCst) != my_gen {
+                return;
+            }
+            restart_session(&config, &subscriptions, &ws_cancel, &data_sender);
+        });
     }
 
     /// Resolves the display precision `(price, size)` for `symbol`, falling back to the
@@ -190,10 +228,9 @@ impl DataClient for MarketStoreDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if let Some(token) = self.ws_cancel.take() {
+        if let Some(token) = self.ws_cancel.lock().unwrap().take() {
             token.cancel();
         }
-        self.ws_task = None;
         self.is_connected.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -227,18 +264,17 @@ impl DataClient for MarketStoreDataClient {
             }
         }
         self.is_connected.store(true, Ordering::SeqCst);
-        // If subscriptions were registered before connect, (re)start the session now.
-        if !self.subscriptions.is_empty() {
-            self.restart_ws_session();
+        // If subscriptions were registered before connect, start the session now.
+        if !self.subscriptions.lock().unwrap().is_empty() {
+            self.restart_now();
         }
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if let Some(token) = self.ws_cancel.take() {
+        if let Some(token) = self.ws_cancel.lock().unwrap().take() {
             token.cancel();
         }
-        self.ws_task = None;
         self.is_connected.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -247,7 +283,7 @@ impl DataClient for MarketStoreDataClient {
         let bar_type = cmd.bar_type;
         let tbk = bar_type_to_tbk(&bar_type)?;
         let (price_precision, size_precision) = self.precision_for_bar_type(&bar_type);
-        self.subscriptions.insert(
+        self.subscriptions.lock().unwrap().insert(
             tbk,
             TbkSubscription {
                 kind: SubKind::Bar {
@@ -264,7 +300,7 @@ impl DataClient for MarketStoreDataClient {
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         let tbk = bar_type_to_tbk(&cmd.bar_type)?;
-        self.subscriptions.remove(&tbk);
+        self.subscriptions.lock().unwrap().remove(&tbk);
         self.restart_if_connected();
         Ok(())
     }
@@ -274,7 +310,7 @@ impl DataClient for MarketStoreDataClient {
         let tbk = trade_tbk(&instrument_id);
         let (price_precision, size_precision) =
             self.precision_for(instrument_id.symbol.as_str());
-        self.subscriptions.insert(
+        self.subscriptions.lock().unwrap().insert(
             tbk,
             TbkSubscription {
                 kind: SubKind::Trade { instrument_id },
@@ -287,7 +323,7 @@ impl DataClient for MarketStoreDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        self.subscriptions.remove(&trade_tbk(&cmd.instrument_id));
+        self.subscriptions.lock().unwrap().remove(&trade_tbk(&cmd.instrument_id));
         self.restart_if_connected();
         Ok(())
     }
@@ -297,7 +333,7 @@ impl DataClient for MarketStoreDataClient {
         let tbk = quote_tbk(&instrument_id);
         let (price_precision, size_precision) =
             self.precision_for(instrument_id.symbol.as_str());
-        self.subscriptions.insert(
+        self.subscriptions.lock().unwrap().insert(
             tbk,
             TbkSubscription {
                 kind: SubKind::Quote { instrument_id },
@@ -310,7 +346,7 @@ impl DataClient for MarketStoreDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        self.subscriptions.remove(&quote_tbk(&cmd.instrument_id));
+        self.subscriptions.lock().unwrap().remove(&quote_tbk(&cmd.instrument_id));
         self.restart_if_connected();
         Ok(())
     }
