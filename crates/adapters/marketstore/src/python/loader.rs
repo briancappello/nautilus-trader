@@ -52,6 +52,30 @@ async fn connect(endpoint: String) -> PyResult<MarketStoreGrpcClient> {
         .map_err(|e| PyRuntimeError::new_err(format!("connect: {e:?}")))
 }
 
+/// Lists all symbols known to MarketStore (universe discovery).
+///
+/// Returns bare symbol names. `timeframe` optionally filters to symbols that have data
+/// for that bucket (e.g. `"1Min"`); `None` returns everything.
+#[pyfunction]
+#[pyo3(name = "list_symbols")]
+#[pyo3(signature = (timeframe=None, endpoint=None))]
+pub fn py_list_symbols(
+    py: Python<'_>,
+    timeframe: Option<&str>,
+    endpoint: Option<&str>,
+) -> PyResult<Vec<String>> {
+    let endpoint = endpoint.unwrap_or(DEFAULT_GRPC_ENDPOINT).to_string();
+    let timeframe = timeframe.map(str::to_string);
+
+    block_on(py, async move {
+        let client = connect(endpoint).await?;
+        client
+            .list_symbols(timeframe.as_deref())
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("list_symbols: {e:?}")))
+    })
+}
+
 /// Loads historical OHLCV bars as wheel `Bar` objects, in ascending epoch order.
 ///
 /// `ts_event` is the bar open; `ts_init` is the bar close (open + interval), which is the

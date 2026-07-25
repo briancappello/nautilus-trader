@@ -68,6 +68,7 @@ pub fn marketstore(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Historical bulk loaders. In-wheel, so these return the engine's own model objects
     // and `engine.add_data(...)` takes them directly — no primitive columns, no
     // Python-side reconstruction. See `python::loader`.
+    m.add_function(wrap_pyfunction!(loader::py_list_symbols, m)?)?;
     m.add_function(wrap_pyfunction!(loader::py_load_bars, m)?)?;
     m.add_function(wrap_pyfunction!(loader::py_load_quote_ticks, m)?)?;
     m.add_function(wrap_pyfunction!(loader::py_load_trade_ticks, m)?)?;

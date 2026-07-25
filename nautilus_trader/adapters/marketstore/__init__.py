@@ -30,6 +30,7 @@ and make Python rebuild every object.
 
 from nautilus_trader.core.nautilus_pyo3.marketstore import MarketStoreDataClientConfig
 from nautilus_trader.core.nautilus_pyo3.marketstore import MarketStoreDataClientFactory
+from nautilus_trader.core.nautilus_pyo3.marketstore import list_symbols
 from nautilus_trader.core.nautilus_pyo3.marketstore import load_bars
 from nautilus_trader.core.nautilus_pyo3.marketstore import load_quote_ticks
 from nautilus_trader.core.nautilus_pyo3.marketstore import load_trade_ticks
@@ -38,6 +39,7 @@ from nautilus_trader.core.nautilus_pyo3.marketstore import load_trade_ticks
 __all__ = [
     "MarketStoreDataClientConfig",
     "MarketStoreDataClientFactory",
+    "list_symbols",
     "load_bars",
     "load_quote_ticks",
     "load_trade_ticks",
