@@ -49,6 +49,8 @@ pub mod data;
 #[cfg(feature = "live")]
 pub mod factories;
 #[cfg(feature = "live")]
+pub mod rpc;
+#[cfg(feature = "live")]
 pub mod ws;
 
 pub use config::{InstrumentSpec, MarketStoreDataClientConfig};
