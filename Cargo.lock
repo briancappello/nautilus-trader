@@ -5481,6 +5481,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 
 [[package]]
+name = "nautilus-alpaca"
+version = "0.61.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-execution",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "pyo3",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "ustr",
+]
+
+[[package]]
 name = "nautilus-analysis"
 version = "0.61.0"
 dependencies = [
@@ -6521,7 +6549,7 @@ dependencies = [
 
 [[package]]
 name = "nautilus-marketstore"
-version = "0.59.0"
+version = "0.61.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6534,10 +6562,12 @@ dependencies = [
  "nautilus-system",
  "prost 0.13.5",
  "pyo3",
+ "reqwest 0.13.4",
  "rmp-serde",
  "serde",
+ "serde_json",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tonic",
  "tonic-build",
@@ -6808,6 +6838,7 @@ name = "nautilus-pyo3"
 version = "0.61.0"
 dependencies = [
  "mimalloc",
+ "nautilus-alpaca",
  "nautilus-analysis",
  "nautilus-architect-ax",
  "nautilus-backtest",
