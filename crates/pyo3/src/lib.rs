@@ -215,6 +215,13 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Adapters
     ////////////////////////////////////////////////////////////////////////////////
 
+    let n = "alpaca";
+    let submodule = pyo3::wrap_pymodule!(nautilus_alpaca::python::alpaca);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
     let n = "architect_ax";
     let submodule = pyo3::wrap_pymodule!(nautilus_architect_ax::python::architect_ax);
     m.add_wrapped(submodule)?;
