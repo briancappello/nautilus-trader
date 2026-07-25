@@ -57,6 +57,11 @@ pub struct MarketStoreDataClientConfig {
     pub price_precision: u8,
     /// Fallback size precision for symbols not in `instruments`.
     pub size_precision: u8,
+    /// Optional wildcard **bar** stream patterns (e.g. `["*/1Min/OHLCV"]`) to subscribe
+    /// the whole market in one glob, instead of one TBK per symbol. Frames arriving for
+    /// a glob-matched key have their `BarType` synthesized from the key + `venue`
+    /// (see [`crate::symbology::tbk_to_bar_type`]). Empty = per-symbol only.
+    pub stream_patterns: Vec<String>,
     /// Optional replay window. When set, the streaming session connects to `/ws/replay`
     /// (instead of `/ws`) and replays historical bars over the window as if live — the
     /// off-hours way to exercise the live `DataClient` (same decode/bus path). `None` =
@@ -78,6 +83,7 @@ pub struct ReplayConfig {
 impl MarketStoreDataClientConfig {
     /// Creates a new [`MarketStoreDataClientConfig`].
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         grpc_endpoint: String,
         ws_endpoint: String,
@@ -86,6 +92,7 @@ impl MarketStoreDataClientConfig {
         price_precision: u8,
         size_precision: u8,
         replay: Option<ReplayConfig>,
+        stream_patterns: Vec<String>,
     ) -> Self {
         Self {
             grpc_endpoint,
@@ -95,6 +102,7 @@ impl MarketStoreDataClientConfig {
             price_precision,
             size_precision,
             replay,
+            stream_patterns,
         }
     }
 }

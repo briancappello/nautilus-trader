@@ -48,7 +48,7 @@ use crate::{
     instruments::instruments_from_config,
     loader::{load_bars, load_quote_ticks, load_trade_ticks},
     symbology::{bar_type_to_tbk, quote_tbk, trade_tbk},
-    ws::{ReplayWindow, SubKind, TbkSubscription, spawn_ws_session},
+    ws::{GlobStreams, ReplayWindow, SubKind, TbkSubscription, spawn_ws_session},
 };
 
 /// Derives the `/ws/replay` endpoint from the configured live `/ws` endpoint.
@@ -81,7 +81,14 @@ fn restart_session(
     }
 
     let subs = subscriptions.lock().unwrap().clone();
-    if subs.is_empty() {
+    let globs = GlobStreams {
+        patterns: config.stream_patterns.clone(),
+        venue: config.venue.clone(),
+        price_precision: config.price_precision,
+        size_precision: config.size_precision,
+    };
+    // Start a session if there is anything to stream — exact TBKs OR glob patterns.
+    if subs.is_empty() && globs.patterns.is_empty() {
         return;
     }
 
@@ -99,7 +106,7 @@ fn restart_session(
     };
 
     let cancel = CancellationToken::new();
-    spawn_ws_session(ws_url, subs, replay, data_sender.clone(), cancel.clone());
+    spawn_ws_session(ws_url, subs, globs, replay, data_sender.clone(), cancel.clone());
     *ws_cancel.lock().unwrap() = Some(cancel);
 }
 
@@ -167,6 +174,25 @@ impl MarketStoreDataClient {
     /// Resolves `(price_precision, size_precision)` for a `BarType`'s symbol.
     fn precision_for_bar_type(&self, bar_type: &BarType) -> (u8, u8) {
         self.precision_for(bar_type.instrument_id().symbol.as_str())
+    }
+
+    /// Turns on upstream tick ingestion for `symbol` via RPC `DataService.Subscribe`.
+    ///
+    /// Tick streams (`1Sec/QUOTE`, `1Sec/TRADE`) are `dynamic_ticks: true` and start empty;
+    /// the WS subscribe only *delivers* a flowing stream, so a live quote/trade sub needs
+    /// this ingestion trigger first (bars are always ingested and skip this). Fired on the
+    /// live runtime, fire-and-forget: an RPC failure is logged but never wedges the WS
+    /// session (bars keep flowing; the tick stream simply stays empty).
+    fn ensure_tick_ingestion(&self, symbol: &str, kind: crate::rpc::TickKind) {
+        let rpc_endpoint = crate::rpc::rpc_endpoint_from_ws(&self.config.ws_endpoint);
+        let symbol = symbol.to_string();
+        get_runtime().spawn(async move {
+            if let Err(e) = crate::rpc::subscribe_ticks(&rpc_endpoint, &symbol, kind).await {
+                log::warn!("MarketStore tick ingestion RPC failed: {e}");
+            } else {
+                log::info!("MarketStore tick ingestion enabled: {symbol} {kind:?}");
+            }
+        });
     }
 
     /// Debounced (re)start used by the `subscribe_*`/`unsubscribe_*` handlers.
@@ -264,8 +290,11 @@ impl DataClient for MarketStoreDataClient {
             }
         }
         self.is_connected.store(true, Ordering::SeqCst);
-        // If subscriptions were registered before connect, start the session now.
-        if !self.subscriptions.lock().unwrap().is_empty() {
+        // Start the session now if anything is streamable: pre-connect subscriptions OR
+        // configured glob patterns (the whole-market wildcard needs no per-symbol subscribe).
+        if !self.subscriptions.lock().unwrap().is_empty()
+            || !self.config.stream_patterns.is_empty()
+        {
             self.restart_now();
         }
         Ok(())
@@ -318,6 +347,8 @@ impl DataClient for MarketStoreDataClient {
                 size_precision,
             },
         );
+        // Step 1: turn on upstream ingestion (dynamic tick stream starts empty).
+        self.ensure_tick_ingestion(instrument_id.symbol.as_str(), crate::rpc::TickKind::Trades);
         self.restart_if_connected();
         Ok(())
     }
@@ -341,6 +372,8 @@ impl DataClient for MarketStoreDataClient {
                 size_precision,
             },
         );
+        // Step 1: turn on upstream ingestion (dynamic tick stream starts empty).
+        self.ensure_tick_ingestion(instrument_id.symbol.as_str(), crate::rpc::TickKind::Quotes);
         self.restart_if_connected();
         Ok(())
     }

@@ -23,6 +23,7 @@ impl MarketStoreDataClientConfig {
         price_precision = 2,
         size_precision = 0,
         replay = None,
+        stream_patterns = Vec::new(),
     ))]
     fn py_new(
         instruments: Vec<(String, u8, u8, u64)>,
@@ -32,6 +33,7 @@ impl MarketStoreDataClientConfig {
         price_precision: u8,
         size_precision: u8,
         replay: Option<(String, String, i64)>,
+        stream_patterns: Vec<String>,
     ) -> PyResult<Self> {
         let specs = instruments
             .into_iter()
@@ -46,6 +48,7 @@ impl MarketStoreDataClientConfig {
             price_precision,
             size_precision,
             replay,
+            stream_patterns,
         ))
     }
 
@@ -65,6 +68,12 @@ impl MarketStoreDataClientConfig {
     #[pyo3(name = "venue")]
     fn py_venue(&self) -> &str {
         &self.venue
+    }
+
+    #[getter]
+    #[pyo3(name = "stream_patterns")]
+    fn py_stream_patterns(&self) -> Vec<String> {
+        self.stream_patterns.clone()
     }
 
     fn __repr__(&self) -> String {
