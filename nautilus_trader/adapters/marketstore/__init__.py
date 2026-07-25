@@ -20,13 +20,25 @@ live ``DataClient`` must share the engine's ABI — see the trading framework's
 ``docs/marketstore_v2_rewrite_plan.md`` §5 #14). This subpackage re-exports the
 pyo3 factory/config classes so downstream code can simply import from
 ``nautilus_trader.adapters.marketstore``.
+
+The historical bulk loaders (``load_bars``, ``load_quote_ticks``,
+``load_trade_ticks``) are exposed here for the same reason. Being in-wheel, they
+return the engine's own model objects, so ``engine.add_data(...)`` accepts the
+result directly — an out-of-wheel loader would have to return primitive columns
+and make Python rebuild every object.
 """
 
 from nautilus_trader.core.nautilus_pyo3.marketstore import MarketStoreDataClientConfig
 from nautilus_trader.core.nautilus_pyo3.marketstore import MarketStoreDataClientFactory
+from nautilus_trader.core.nautilus_pyo3.marketstore import load_bars
+from nautilus_trader.core.nautilus_pyo3.marketstore import load_quote_ticks
+from nautilus_trader.core.nautilus_pyo3.marketstore import load_trade_ticks
 
 
 __all__ = [
     "MarketStoreDataClientConfig",
     "MarketStoreDataClientFactory",
+    "load_bars",
+    "load_quote_ticks",
+    "load_trade_ticks",
 ]
