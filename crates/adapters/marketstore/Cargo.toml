@@ -13,11 +13,9 @@ homepage.workspace = true
 name = "nautilus_marketstore"
 crate-type = ["rlib"]
 
-# The engine-agnostic source (decode/grpc/symbology/loader/common + proto build) is the
-# SINGLE SOURCE OF TRUTH in the trading repo at ../trading/crates/marketstore and is brought
-# in here via `#[path]` includes (see src/lib.rs) so it compiles against THIS crate's
-# nautilus deps (fork HEAD, high-precision ON) — not the standalone workspace's crates.io 0.58.
-# Only the in-wheel-only modules (config/instruments/factories/data + pyo3) live here.
+# Self-contained: the proto and the engine-agnostic modules (common/decode/grpc/
+# symbology/loader) are vendored under this crate. It builds from a bare clone of this
+# repository with no reference to any sibling checkout.
 
 [features]
 default = ["live"]

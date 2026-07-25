@@ -1,40 +1,32 @@
 //! MarketStore data adapter for NautilusTrader v2 (in-wheel build).
 //!
-//! This crate is the **in-wheel** counterpart of the standalone `nautilus-marketstore`
-//! crate in the trading repo (`../trading/crates/marketstore`). The live `DataClient`
-//! must compile INTO the nautilus wheel (cross-cdylib boundary — see
-//! `docs/marketstore_v2_rewrite_plan.md` §5 #14), so this crate is vendored into the
-//! fork's workspace and compiles against the fork's own nautilus crates (HEAD,
-//! high-precision ON).
+//! The live `DataClient` must compile INTO the nautilus wheel (cross-cdylib boundary —
+//! see `docs/marketstore_v2_rewrite_plan.md` §5 #14), so this crate lives in the fork's
+//! workspace and compiles against the fork's own nautilus crates.
 //!
-//! **Single source of truth.** The engine-agnostic modules (`common`, `decode`, `grpc`,
-//! `symbology`, `loader`) and the proto are NOT duplicated — they are `#[path]`-included
-//! from the trading repo so there is exactly one copy of the decode/gRPC logic. They use
-//! only stable nautilus + tonic APIs, so the same source compiles in both build contexts
-//! (standalone: crates.io 0.58 + tonic 0.14; in-wheel: fork HEAD + tonic 0.13).
+//! **Self-contained.** Everything this crate needs — the proto and the engine-agnostic
+//! modules (`common`, `decode`, `grpc`, `symbology`, `loader`) — is vendored here. It
+//! builds from a bare clone of this repository alone and makes no assumption about any
+//! sibling checkout on the filesystem. An earlier revision `#[path]`-included those
+//! modules from a private sibling repo, which meant the crate could not build on a
+//! machine that lacked it, could not be upstreamed, and broke in every git worktree.
 //!
-//! The **in-wheel-only** modules (`config`, `instruments`, `factories`, `data`, `python`)
-//! live here — they are the live `impl DataClient` glue that only makes sense inside the
-//! wheel.
+//! Downstream consumers that need the same decode/gRPC logic should depend on this
+//! crate rather than keeping a parallel copy.
 
-/// Generated tonic client + message types from the trading repo's vendored proto.
+/// Generated tonic client + message types from the vendored `proto/marketstore.proto`.
 ///
 /// The proto package is `proto`; tonic-build emits `$OUT_DIR/proto.rs`.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/proto.rs"));
 }
 
-// --- Engine-agnostic modules (shared source from the trading repo) ----------
-#[path = "../../../../../trading/crates/marketstore/src/common.rs"]
+// --- Engine-agnostic modules (transport + decode, no live-client deps) ------
 pub mod common;
-#[path = "../../../../../trading/crates/marketstore/src/decode.rs"]
 pub mod decode;
-#[path = "../../../../../trading/crates/marketstore/src/grpc.rs"]
 pub mod grpc;
-#[path = "../../../../../trading/crates/marketstore/src/symbology.rs"]
-pub mod symbology;
-#[path = "../../../../../trading/crates/marketstore/src/loader.rs"]
 pub mod loader;
+pub mod symbology;
 
 pub use decode::RawBars;
 pub use grpc::MarketStoreGrpcClient;
