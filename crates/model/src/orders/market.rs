@@ -384,6 +384,10 @@ impl Order for MarketOrder {
         self.slippage
     }
 
+    fn reference_price(&self) -> Option<Price> {
+        self.reference_price
+    }
+
     fn init_id(&self) -> UUID4 {
         self.init_id
     }
@@ -409,10 +413,18 @@ impl Order for MarketOrder {
     }
 
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
+        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
+
         self.core.apply(event.clone())?;
 
         if let OrderEventAny::Updated(ref event) = event {
             self.update(event);
+        }
+
+        // A MARKET order has no limit price to measure order-price slippage against, but if it
+        // carries a decision-time reference price we can record implementation-shortfall slippage.
+        if is_order_filled {
+            self.core.set_slippage();
         }
 
         Ok(())
@@ -459,6 +471,10 @@ impl Order for MarketOrder {
 
     fn set_quantity(&mut self, quantity: Quantity) {
         self.quantity = quantity;
+    }
+
+    fn set_reference_price(&mut self, reference_price: Option<Price>) {
+        self.reference_price = reference_price;
     }
 
     fn set_leaves_qty(&mut self, leaves_qty: Quantity) {
@@ -528,7 +544,8 @@ impl TryFrom<OrderInitialized> for MarketOrder {
     type Error = OrderError;
 
     fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
-        Self::new_checked(
+        let reference_price = event.reference_price;
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -548,7 +565,9 @@ impl TryFrom<OrderInitialized> for MarketOrder {
             event.exec_algorithm_params,
             event.exec_spawn_id,
             event.tags,
-        )
+        )?;
+        order.reference_price = reference_price;
+        Ok(order)
     }
 }
 
@@ -715,5 +734,36 @@ mod tests {
         // Verify updates were applied correctly
         assert_eq!(accepted_order.price(), Some(calculated_protection_price));
         assert!(accepted_order.has_price());
+    }
+
+    #[rstest]
+    fn test_market_order_reference_price_defaults_none(audusd_sim: CurrencyPair) {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(audusd_sim.id)
+            .quantity(Quantity::from(10))
+            .side(OrderSide::Buy)
+            .build();
+        assert_eq!(order.reference_price(), None);
+    }
+
+    #[rstest]
+    fn test_market_order_reference_price_set_at_build(audusd_sim: CurrencyPair) {
+        let reference_price = Price::new(0.75, 5);
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(audusd_sim.id)
+            .quantity(Quantity::from(10))
+            .side(OrderSide::Buy)
+            .reference_price(reference_price)
+            .build();
+
+        // Reference price is set, but it is not the order's working `price()` (a MARKET
+        // order has no limit price; reference_price is decision-time metadata only).
+        assert_eq!(order.reference_price(), Some(reference_price));
+        assert_eq!(order.price(), None);
+        assert!(!order.has_price());
+
+        // Round-trips through the OrderInitialized snapshot rebuilt from the order.
+        let init: crate::events::OrderInitialized = (&order).into();
+        assert_eq!(init.reference_price, Some(reference_price));
     }
 }

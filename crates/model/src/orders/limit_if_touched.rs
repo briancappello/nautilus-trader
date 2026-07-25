@@ -441,6 +441,10 @@ impl Order for LimitIfTouchedOrder {
         self.slippage
     }
 
+    fn reference_price(&self) -> Option<Price> {
+        self.reference_price
+    }
+
     fn init_id(&self) -> UUID4 {
         self.init_id
     }
@@ -502,7 +506,7 @@ impl Order for LimitIfTouchedOrder {
         }
 
         if is_order_filled {
-            self.core.set_slippage(self.price);
+            self.core.set_slippage();
         }
 
         Ok(())
@@ -531,6 +535,10 @@ impl Order for LimitIfTouchedOrder {
 
     fn set_quantity(&mut self, quantity: Quantity) {
         self.quantity = quantity;
+    }
+
+    fn set_reference_price(&mut self, reference_price: Option<Price>) {
+        self.reference_price = reference_price;
     }
 
     fn set_leaves_qty(&mut self, leaves_qty: Quantity) {
@@ -598,7 +606,8 @@ impl TryFrom<OrderInitialized> for LimitIfTouchedOrder {
                     message: "`trigger_type` is required for `LimitIfTouchedOrder` initialization"
                         .to_string(),
                 })?;
-        Self::new_checked(
+        let reference_price = event.reference_price;
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -626,7 +635,9 @@ impl TryFrom<OrderInitialized> for LimitIfTouchedOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.reference_price = reference_price;
+        Ok(order)
     }
 }
 
@@ -815,6 +826,7 @@ mod tests {
             .side(OrderSide::Buy) // Explicitly setting Buy side
             .price(Price::new(95.0, 2)) // Limit price
             .trigger_price(Price::new(90.0, 2)) // Trigger price LOWER than fill price
+            .reference_price(Price::new(90.0, 2)) // Decision-time price slippage anchors on
             .trigger_type(TriggerType::Default)
             .build();
 
@@ -841,12 +853,11 @@ mod tests {
             .apply(OrderEventAny::Filled(order_filled_event))
             .unwrap();
 
-        // The slippage calculation should be triggered by the filled event
-        print!("Slippageee: {:?}", accepted_order.slippage());
+        // Slippage (fill 98.50 vs decision-time reference 90.0) should be set by the fill.
         assert!(accepted_order.slippage().is_some());
 
-        // We can also check the actual slippage value
-        let expected_slippage = 98.50 - 95.0;
+        // Slippage is fill vs the decision-time reference price (90.0), not the limit price.
+        let expected_slippage = 98.50 - 90.0;
         let actual_slippage = accepted_order.slippage().unwrap();
 
         assert!(

@@ -454,6 +454,10 @@ impl Order for TrailingStopLimitOrder {
         self.slippage
     }
 
+    fn reference_price(&self) -> Option<Price> {
+        self.reference_price
+    }
+
     fn init_id(&self) -> UUID4 {
         self.init_id
     }
@@ -515,7 +519,7 @@ impl Order for TrailingStopLimitOrder {
         }
 
         if is_order_filled {
-            self.core.set_slippage(self.price);
+            self.core.set_slippage();
         }
 
         Ok(())
@@ -543,6 +547,10 @@ impl Order for TrailingStopLimitOrder {
 
     fn set_quantity(&mut self, quantity: Quantity) {
         self.quantity = quantity;
+    }
+
+    fn set_reference_price(&mut self, reference_price: Option<Price>) {
+        self.reference_price = reference_price;
     }
 
     fn set_leaves_qty(&mut self, leaves_qty: Quantity) {
@@ -649,7 +657,8 @@ impl TryFrom<OrderInitialized> for TrailingStopLimitOrder {
                         .to_string(),
             }
                 })?;
-        Self::new_checked(
+        let reference_price = event.reference_price;
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -680,7 +689,9 @@ impl TryFrom<OrderInitialized> for TrailingStopLimitOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.reference_price = reference_price;
+        Ok(order)
     }
 }
 

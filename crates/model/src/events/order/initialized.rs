@@ -87,6 +87,10 @@ pub struct OrderInitialized {
     pub price: Option<Price>,
     /// The order trigger price (STOP).
     pub trigger_price: Option<Price>,
+    /// The reference price captured at order instantiation (e.g. decision-time or indicative
+    /// price for `MARKET` orders), used for pre-trade risk valuation and slippage attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_price: Option<Price>,
     /// The trigger type for the order.
     pub trigger_type: Option<TriggerType>,
     /// The trailing offset for the orders limit price.
@@ -202,6 +206,7 @@ impl OrderInitialized {
             exec_spawn_id,
             tags,
             causation_id: None,
+            reference_price: None,
         }
     }
 }

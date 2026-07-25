@@ -395,6 +395,10 @@ impl Order for MarketToLimitOrder {
         self.slippage
     }
 
+    fn reference_price(&self) -> Option<Price> {
+        self.reference_price
+    }
+
     fn init_id(&self) -> UUID4 {
         self.init_id
     }
@@ -444,8 +448,8 @@ impl Order for MarketToLimitOrder {
             self.update(event);
         }
 
-        if is_order_filled && let Some(price) = self.price {
-            self.core.set_slippage(price);
+        if is_order_filled {
+            self.core.set_slippage();
         }
 
         Ok(())
@@ -476,6 +480,10 @@ impl Order for MarketToLimitOrder {
 
     fn set_quantity(&mut self, quantity: Quantity) {
         self.quantity = quantity;
+    }
+
+    fn set_reference_price(&mut self, reference_price: Option<Price>) {
+        self.reference_price = reference_price;
     }
 
     fn set_leaves_qty(&mut self, leaves_qty: Quantity) {
@@ -545,7 +553,8 @@ impl TryFrom<OrderInitialized> for MarketToLimitOrder {
     type Error = OrderError;
 
     fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
-        Self::new_checked(
+        let reference_price = event.reference_price;
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -568,7 +577,9 @@ impl TryFrom<OrderInitialized> for MarketToLimitOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.reference_price = reference_price;
+        Ok(order)
     }
 }
 
@@ -717,11 +728,13 @@ mod tests {
 
     #[rstest]
     fn test_market_to_limit_order_sets_slippage_when_filled() {
-        // Create a MarketToLimitOrder
+        // Create a MarketToLimitOrder with a decision-time reference price (slippage anchors on
+        // this, not the order's working limit price).
         let order = OrderTestBuilder::new(OrderType::MarketToLimit)
             .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
             .quantity(Quantity::from(10))
             .side(OrderSide::Buy)
+            .reference_price(Price::new(90.0, 2))
             .build();
 
         // Accept the order first
@@ -768,8 +781,7 @@ mod tests {
         // The slippage calculation should be triggered by the filled event
         assert!(accepted_order.slippage().is_some());
 
-        // Additionally, verify the actual slippage value is correct
-        // The slippage would be 98.50 - 90.0 = 8.50 for a Buy order
+        // Slippage is fill (98.50) vs decision-time reference price (90.0) = 8.50 for a BUY.
         assert_eq!(accepted_order.slippage().unwrap(), 8.50);
     }
 }

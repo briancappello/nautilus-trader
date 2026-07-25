@@ -72,6 +72,7 @@ pub struct OrderInitializedSpec {
     pub ts_init: UnixNanos,
     pub price: Option<Price>,
     pub trigger_price: Option<Price>,
+    pub reference_price: Option<Price>,
     pub trigger_type: Option<TriggerType>,
     pub limit_offset: Option<Decimal>,
     pub trailing_offset: Option<Decimal>,
@@ -95,7 +96,7 @@ impl<S: order_initialized_spec_builder::IsComplete> OrderInitializedSpecBuilder<
     #[must_use]
     pub fn build(self) -> OrderInitialized {
         let spec = self.into_spec();
-        OrderInitialized::new(
+        let mut event = OrderInitialized::new(
             spec.trader_id,
             spec.strategy_id,
             spec.instrument_id,
@@ -129,7 +130,11 @@ impl<S: order_initialized_spec_builder::IsComplete> OrderInitializedSpecBuilder<
             spec.exec_algorithm_params,
             spec.exec_spawn_id,
             spec.tags,
-        )
+        );
+        // `reference_price` is not part of `OrderInitialized::new` (kept off the positional
+        // signature, like `causation_id`); set it on the built event for test scenarios.
+        event.reference_price = spec.reference_price;
+        event
     }
 }
 

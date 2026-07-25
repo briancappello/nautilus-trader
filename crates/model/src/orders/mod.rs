@@ -303,6 +303,11 @@ pub trait Order: 'static + Send {
     fn activation_price(&self) -> Option<Price> {
         None
     }
+    /// The reference price captured at order instantiation (e.g. decision-time or indicative
+    /// price for `MARKET` orders). Immutable after init; defaults to `None`.
+    fn reference_price(&self) -> Option<Price> {
+        None
+    }
     fn trigger_type(&self) -> Option<TriggerType>;
     fn liquidity_side(&self) -> Option<LiquiditySide>;
     fn is_post_only(&self) -> bool;
@@ -338,6 +343,9 @@ pub trait Order: 'static + Send {
     }
 
     fn avg_px(&self) -> Option<f64>;
+    /// Adverse slippage of the fill average price against the decision-time reference price
+    /// (implementation shortfall). Adverse-only; `None` if no reference price, no fills, or the
+    /// fill was at/better than the reference price. See [`OrderCore::set_slippage`].
     fn slippage(&self) -> Option<f64>;
     fn init_id(&self) -> UUID4;
     fn ts_init(&self) -> UnixNanos;
@@ -634,6 +642,8 @@ pub trait Order: 'static + Send {
     fn is_triggered(&self) -> Option<bool>; // TODO: Temporary on trait
     fn set_position_id(&mut self, position_id: Option<PositionId>);
     fn set_quantity(&mut self, quantity: Quantity);
+    /// Sets the reference price (decision-time / indicative price) captured at instantiation.
+    fn set_reference_price(&mut self, reference_price: Option<Price>);
     fn set_leaves_qty(&mut self, leaves_qty: Quantity);
     fn set_emulation_trigger(&mut self, emulation_trigger: Option<TriggerType>);
     fn set_is_quote_quantity(&mut self, is_quote_quantity: bool);
@@ -657,6 +667,7 @@ where
             quantity: order.quantity(),
             price: order.price(),
             trigger_price: order.trigger_price(),
+            reference_price: order.reference_price(),
             trigger_type: order.trigger_type(),
             time_in_force: order.time_in_force(),
             expire_time: order.expire_time(),
@@ -723,6 +734,7 @@ pub struct OrderCore {
     pub overfill_qty: Quantity,
     pub avg_px: Option<f64>,
     pub slippage: Option<f64>,
+    pub reference_price: Option<Price>,
     pub init_id: UUID4,
     pub ts_init: UnixNanos,
     pub ts_submitted: Option<UnixNanos>,
@@ -774,6 +786,7 @@ impl OrderCore {
             overfill_qty: Quantity::zero(init.quantity.precision),
             avg_px: None,
             slippage: None,
+            reference_price: init.reference_price,
             init_id: init.event_id,
             ts_init: init.ts_event,
             ts_submitted: None,
@@ -1037,15 +1050,28 @@ impl OrderCore {
         self.avg_px = Some(avg_px);
     }
 
-    pub fn set_slippage(&mut self, price: Price) {
-        self.slippage = self.avg_px.and_then(|avg_px| {
-            let current_price = price.as_f64();
-            match self.side {
-                OrderSide::Buy if avg_px > current_price => Some(avg_px - current_price),
-                OrderSide::Sell if avg_px < current_price => Some(current_price - avg_px),
-                _ => None,
+    /// Computes adverse slippage of the fill average price against the order's decision-time
+    /// [`reference_price`](Self::reference_price), storing it in [`slippage`](Self::slippage).
+    ///
+    /// This is the implementation-shortfall measure: how much *worse* than the price expected
+    /// when the order was created the order actually filled. Slippage is anchored on the
+    /// decision-time reference price (not the order's own limit/trigger price — a limit price is
+    /// the *worst allowed* fill, not an expectation, so filling inside it is price improvement,
+    /// not negative slippage). It is **adverse-only**: a fill at or better than the reference
+    /// price yields `None`. It is a no-op when either `reference_price` or `avg_px` (no fills)
+    /// is unset — so orders submitted without a reference price have `slippage == None`.
+    pub fn set_slippage(&mut self) {
+        self.slippage = match (self.reference_price, self.avg_px) {
+            (Some(reference_price), Some(avg_px)) => {
+                let reference = reference_price.as_f64();
+                match self.side {
+                    OrderSide::Buy if avg_px > reference => Some(avg_px - reference),
+                    OrderSide::Sell if avg_px < reference => Some(reference - avg_px),
+                    _ => None,
+                }
             }
-        });
+            _ => None,
+        };
     }
 
     /// Returns the opposite order side.
@@ -1245,6 +1271,103 @@ mod tests {
         assert!(order.is_closed());
         assert_eq!(order.commission(&Currency::USD()), None);
         assert_eq!(order.commissions(), &IndexMap::new());
+    }
+
+    #[rstest]
+    fn test_slippage_none_without_reference_price() {
+        // No reference price set → slippage stays None even after a fill (a MARKET order has no
+        // limit price, and slippage is now anchored solely on the decision-time reference price).
+        let init = OrderInitializedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Submitted(OrderSubmittedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(OrderAcceptedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_px(Price::from("1.50000"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.avg_px(), Some(1.5));
+        assert_eq!(order.slippage(), None);
+    }
+
+    #[rstest]
+    fn test_slippage_market_buy_adverse() {
+        // BUY filled WORSE (higher) than the decision-time reference price → adverse slippage.
+        let init = OrderInitializedSpec::builder()
+            .order_side(OrderSide::Buy)
+            .reference_price(Price::from("1.00000"))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Submitted(OrderSubmittedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(OrderAcceptedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_px(Price::from("1.20000"))
+                    .build(),
+            ))
+            .unwrap();
+        // Filled at 1.20 vs reference 1.00 → 0.20 adverse.
+        assert!((order.slippage().unwrap() - 0.20).abs() < 1e-9);
+    }
+
+    #[rstest]
+    fn test_slippage_market_buy_price_improvement_is_none() {
+        // BUY filled BETTER (lower) than the reference price → not slippage (price improvement).
+        let init = OrderInitializedSpec::builder()
+            .order_side(OrderSide::Buy)
+            .reference_price(Price::from("1.00000"))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Submitted(OrderSubmittedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(OrderAcceptedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_px(Price::from("0.90000"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.slippage(), None);
+    }
+
+    #[rstest]
+    fn test_slippage_market_sell_adverse() {
+        // SELL filled WORSE (lower) than the reference price → adverse slippage.
+        let init = OrderInitializedSpec::builder()
+            .order_side(OrderSide::Sell)
+            .reference_price(Price::from("2.00000"))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Submitted(OrderSubmittedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(OrderAcceptedSpec::builder().build()))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_px(Price::from("1.85000"))
+                    .build(),
+            ))
+            .unwrap();
+        // Sold at 1.85 vs reference 2.00 → 0.15 adverse.
+        assert!((order.slippage().unwrap() - 0.15).abs() < 1e-9);
     }
 
     #[rstest]

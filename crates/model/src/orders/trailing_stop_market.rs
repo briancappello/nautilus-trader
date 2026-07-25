@@ -440,6 +440,10 @@ impl Order for TrailingStopMarketOrder {
         self.slippage
     }
 
+    fn reference_price(&self) -> Option<Price> {
+        self.reference_price
+    }
+
     fn init_id(&self) -> UUID4 {
         self.init_id
     }
@@ -501,7 +505,7 @@ impl Order for TrailingStopMarketOrder {
         }
 
         if was_filled {
-            self.core.set_slippage(self.trigger_price);
+            self.core.set_slippage();
         }
 
         Ok(())
@@ -528,6 +532,10 @@ impl Order for TrailingStopMarketOrder {
 
     fn set_quantity(&mut self, quantity: Quantity) {
         self.quantity = quantity;
+    }
+
+    fn set_reference_price(&mut self, reference_price: Option<Price>) {
+        self.reference_price = reference_price;
     }
 
     fn set_leaves_qty(&mut self, leaves_qty: Quantity) {
@@ -616,7 +624,8 @@ impl TryFrom<OrderInitialized> for TrailingStopMarketOrder {
                     .to_string(),
             }
         })?;
-        Self::new_checked(
+        let reference_price = event.reference_price;
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -644,7 +653,9 @@ impl TryFrom<OrderInitialized> for TrailingStopMarketOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.reference_price = reference_price;
+        Ok(order)
     }
 }
 
@@ -863,6 +874,7 @@ mod tests {
             .quantity(Quantity::from(10))
             .side(OrderSide::Buy) // Explicitly setting Buy side
             .trigger_price(Price::new(90.0, 2)) // Trigger price LOWER than fill price
+            .reference_price(Price::new(90.0, 2)) // Decision-time price slippage anchors on
             .trailing_offset(Decimal::new(5, 1)) // 0.5
             .trailing_offset_type(TrailingOffsetType::NoTrailingOffset)
             .build();

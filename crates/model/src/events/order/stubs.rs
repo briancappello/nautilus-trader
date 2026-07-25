@@ -548,6 +548,7 @@ impl TestDefault for OrderInitialized {
             quantity: Quantity::new(100_000.0, 0),
             price: Option::default(),
             trigger_price: Option::default(),
+            reference_price: Option::default(),
             trigger_type: Option::default(),
             time_in_force: TimeInForce::Day,
             expire_time: Option::default(),

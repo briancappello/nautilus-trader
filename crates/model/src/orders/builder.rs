@@ -55,6 +55,7 @@ pub struct OrderTestBuilder {
     quantity: Option<Quantity>,
     price: Option<Price>,
     trigger_price: Option<Price>,
+    reference_price: Option<Price>,
     trigger_type: Option<TriggerType>,
     limit_offset: Option<Decimal>,
     trailing_offset: Option<Decimal>,
@@ -98,6 +99,7 @@ impl OrderTestBuilder {
             quantity: None,
             price: None,
             trigger_price: None,
+            reference_price: None,
             trigger_type: None,
             limit_offset: None,
             trailing_offset: None,
@@ -234,6 +236,12 @@ impl OrderTestBuilder {
 
     fn get_trigger_price(&self) -> Price {
         self.trigger_price.expect("Trigger price not set")
+    }
+
+    // ----------- ReferencePrice ----------
+    pub fn reference_price(&mut self, reference_price: Price) -> &mut Self {
+        self.reference_price = Some(reference_price);
+        self
     }
 
     // ----------- TriggerType ----------
@@ -739,6 +747,10 @@ impl OrderTestBuilder {
                 ))
             }
         };
+
+        if self.reference_price.is_some() {
+            order.set_reference_price(self.reference_price);
+        }
 
         if self.submitted {
             let submit_event = OrderSubmittedSpec::builder()

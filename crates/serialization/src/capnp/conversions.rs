@@ -4008,6 +4008,8 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
             exec_spawn_id,
             tags,
             causation_id: None,
+            // capnp schema does not (yet) carry reference_price; default to None on decode.
+            reference_price: None,
         })
     }
 }
